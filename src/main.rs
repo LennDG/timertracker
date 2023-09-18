@@ -2,7 +2,7 @@
 use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{broadcast, mpsc},
     task::JoinSet,
     time::{self, Instant, Sleep},
 };
@@ -20,11 +20,11 @@ async fn main() {
         .await
         .unwrap();
     timer_add_tx
-        .send(("Bar".to_string(), Duration::from_secs(10)))
+        .send(("Bar".to_string(), Duration::from_secs(2)))
         .await
         .unwrap();
     timer_add_tx
-        .send(("Baz".to_string(), Duration::from_secs(2)))
+        .send(("Baz".to_string(), Duration::from_secs(10)))
         .await
         .unwrap();
 
@@ -34,7 +34,6 @@ async fn main() {
         .await
         .unwrap();
 
-    // TODO: This is not adding it, so apparently Timer is not dropped
     timer_add_tx
         .send(("Foo".to_string(), Duration::from_secs(1)))
         .await
@@ -44,7 +43,7 @@ async fn main() {
 }
 
 struct TimerTracker {
-    timers: HashMap<String, broadcast::Sender<String>>,
+    timers: HashMap<String, broadcast::Sender<Duration>>,
     timer_rx: mpsc::Receiver<(String, Duration)>,
 }
 
@@ -66,7 +65,7 @@ impl TimerTracker {
             } else {
                 println!("Restart timer {}", name);
                 // restart the timer or re-add it if it was removed
-                match self.timers.get(&name).unwrap().send("restart".to_string()) {
+                match self.timers.get(&name).unwrap().send(duration) {
                     Ok(_) => (),
                     Err(_) => {
                         self.add_timer(name, duration);
@@ -77,7 +76,7 @@ impl TimerTracker {
     }
 
     fn add_timer(&mut self, name: String, duration: Duration) {
-        let (restart_tx, _) = broadcast::channel::<String>(1);
+        let (restart_tx, _) = broadcast::channel::<Duration>(1);
         let timer = Timer::new(name.clone(), duration, restart_tx.clone());
 
         tokio::spawn(timer.start());
@@ -88,11 +87,11 @@ impl TimerTracker {
 struct Timer {
     name: String,
     duration: Duration,
-    sender: broadcast::Sender<String>,
+    sender: broadcast::Sender<Duration>,
 }
 
 impl Timer {
-    pub fn new(name: String, duration: Duration, sender: broadcast::Sender<String>) -> Self {
+    pub fn new(name: String, duration: Duration, sender: broadcast::Sender<Duration>) -> Self {
         Timer {
             duration,
             name,
@@ -108,18 +107,17 @@ impl Timer {
 
             timeout.spawn(async move {
                 time::sleep(dur).await;
-                true
+                Duration::from_secs(0)
             });
-            timeout.spawn(async move {
-                receiver.recv().await;
-                false
-            });
+            timeout.spawn(async move { receiver.recv().await.unwrap() });
 
-            if timeout.join_next().await.unwrap().unwrap() {
+            let new_duration = timeout.join_next().await.unwrap().unwrap();
+            if new_duration == Duration::from_secs(0) {
                 println!("{} timer timed out!", self.name);
                 return;
             } else {
-                println!("{} timer restarted!", self.name)
+                println!("{} timer restarted!", self.name);
+                self.duration = new_duration;
             }
         }
     }
