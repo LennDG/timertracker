@@ -2,7 +2,7 @@
 use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, watch},
     task::JoinSet,
     time::{self, Instant, Sleep},
 };
@@ -11,17 +11,9 @@ use tokio::{
 async fn main() {
     // timer sender and receivers
     let (timer_add_tx, mut timer_add_rx) = mpsc::channel::<(String, Duration)>(10);
-    //let (timer_timeout_tx, timer_timeout_rx) = watch::channel("".to_string());
+    let mut timer_tracker = TimerTracker::new(timer_add_rx);
 
-    let timers = tokio::spawn(async move {
-        let mut timers = JoinSet::new();
-
-        loop {
-            let (name, duration) = timer_add_rx.recv().await.unwrap();
-            let mut timer = Timer::new(name, duration);
-            timers.spawn(timer.start());
-        }
-    });
+    tokio::spawn(async move { timer_tracker.start().await });
 
     timer_add_tx
         .send(("Foo".to_string(), Duration::from_secs(1)))
@@ -36,61 +28,99 @@ async fn main() {
         .await
         .unwrap();
 
-    timers.await.unwrap();
+    time::sleep(Duration::from_secs(2)).await;
+    timer_add_tx
+        .send(("Bar".to_string(), Duration::from_secs(10)))
+        .await
+        .unwrap();
+
+    // TODO: This is not adding it, so apparently Timer is not dropped
+    timer_add_tx
+        .send(("Foo".to_string(), Duration::from_secs(1)))
+        .await
+        .unwrap();
+
+    time::sleep(Duration::from_secs(30)).await
 }
 
 struct TimerTracker {
-    timers: HashMap<String, Timer>,
-    reset_rx: mpsc::Receiver<String>,
+    timers: HashMap<String, broadcast::Sender<String>>,
+    timer_rx: mpsc::Receiver<(String, Duration)>,
+}
+
+impl TimerTracker {
+    fn new(timer_rx: mpsc::Receiver<(String, Duration)>) -> Self {
+        TimerTracker {
+            timers: HashMap::new(),
+            timer_rx,
+        }
+    }
+
+    async fn start(mut self) {
+        loop {
+            let (name, duration) = self.timer_rx.recv().await.unwrap();
+            // Check if there is an entry in the hashmap already, if not create one.
+            if !self.timers.contains_key(&name) {
+                println!("adding timer {}", name);
+                self.add_timer(name, duration); // new timer and sender
+            } else {
+                println!("Restart timer {}", name);
+                // restart the timer or re-add it if it was removed
+                match self.timers.get(&name).unwrap().send("restart".to_string()) {
+                    Ok(_) => (),
+                    Err(_) => {
+                        self.add_timer(name, duration);
+                    }
+                };
+            };
+        }
+    }
+
+    fn add_timer(&mut self, name: String, duration: Duration) {
+        let (restart_tx, _) = broadcast::channel::<String>(1);
+        let timer = Timer::new(name.clone(), duration, restart_tx.clone());
+
+        tokio::spawn(timer.start());
+        self.timers.insert(name, restart_tx);
+    }
 }
 
 struct Timer {
     name: String,
     duration: Duration,
-    sender: mpsc::Sender<String>,
-    receiver: mpsc::Receiver<String>,
-    timer: Sleep,
+    sender: broadcast::Sender<String>,
 }
 
 impl Timer {
-    pub fn new(name: String, duration: Duration) -> Self {
-        let (sender, receiver) = mpsc::channel(1);
+    pub fn new(name: String, duration: Duration, sender: broadcast::Sender<String>) -> Self {
         Timer {
             duration,
             name,
             sender,
-            receiver,
-            timer: time::sleep(duration),
         }
     }
 
-    pub async fn start(self) {
-        let sender = self.sender.clone();
-        self.timer.await;
-        println!("{} done sleeping!", self.name);
-        sender.send(self.name).await;
-    }
+    pub async fn start(mut self) {
+        loop {
+            let dur = self.duration;
+            let mut receiver = self.sender.subscribe();
+            let mut timeout = JoinSet::new();
 
-    // pub async fn reset(self) {
-    //     self.timer.reset();
-    // }
-}
+            timeout.spawn(async move {
+                time::sleep(dur).await;
+                true
+            });
+            timeout.spawn(async move {
+                receiver.recv().await;
+                false
+            });
 
-struct FutureTimer {
-    name: String,
-    duration: Duration,
-    sender: mpsc::Sender<String>,
-    receiver: mpsc::Receiver<String>,
-    timer: Sleep,
-}
-
-impl Future for FutureTimer {
-    type Output = ();
-
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        todo!()
+            if timeout.join_next().await.unwrap().unwrap() {
+                println!("{} timer timed out!", self.name);
+                return;
+            } else {
+                println!("{} timer restarted!", self.name)
+            }
+        }
     }
 }
